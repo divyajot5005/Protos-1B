@@ -176,11 +176,16 @@ class Trainer:
     def _capture_rng_state(self) -> dict[str, Any]:
         state = {
             "python": random.getstate(),
-            "torch": torch.get_rng_state(),
+            "torch": torch.get_rng_state().cpu(),
         }
         if torch.cuda.is_available():
-            state["cuda"] = torch.cuda.get_rng_state_all()
+            state["cuda"] = [rng_state.cpu() for rng_state in torch.cuda.get_rng_state_all()]
         return state
+
+    def _coerce_rng_state_tensor(self, value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=torch.uint8, device="cpu")
+        return torch.tensor(value, dtype=torch.uint8)
 
     def _restore_rng_state(self, state: dict[str, Any] | None) -> None:
         if not state:
@@ -188,9 +193,10 @@ class Trainer:
         if "python" in state:
             random.setstate(state["python"])
         if "torch" in state:
-            torch.set_rng_state(state["torch"])
+            torch.set_rng_state(self._coerce_rng_state_tensor(state["torch"]))
         if torch.cuda.is_available() and "cuda" in state:
-            torch.cuda.set_rng_state_all(state["cuda"])
+            cuda_states = [self._coerce_rng_state_tensor(rng_state) for rng_state in state["cuda"]]
+            torch.cuda.set_rng_state_all(cuda_states)
 
     def _checkpoint_payload(self, step: int, last_val_perplexity: float | None = None) -> dict[str, Any]:
         payload = {
