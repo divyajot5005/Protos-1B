@@ -59,6 +59,7 @@ class TrainingConfig:
     compile_model: bool = False
     seed: int = 7
     test_mode: bool = False
+    projection_target_tokens: int = 200_000_000_000
 
 
 def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -97,6 +98,15 @@ def load_training_config(config_path: str | None) -> TrainingConfig:
     config["optimizer"] = OptimizerConfig(**config["optimizer"])
     config["checkpointing"] = CheckpointConfig(**config["checkpointing"])
     return TrainingConfig(**config)
+
+
+def _format_duration(seconds: float) -> str:
+    if not math.isfinite(seconds):
+        return "inf"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{days}d {hours}h {minutes}m"
 
 
 class Trainer:
@@ -144,6 +154,7 @@ class Trainer:
         self.tokens_processed = 0
         self.best_val_perplexity: float | None = None
         self.last_log_time = time.perf_counter()
+        self.train_start_time = time.perf_counter()
         self.loaded_resume_path: str | None = None
         self._exit_checkpoint_written = False
 
@@ -257,6 +268,7 @@ class Trainer:
         self.global_step = int(payload.get("step", 0))
         self.tokens_processed = int(payload.get("tokens_processed", 0))
         self.best_val_perplexity = payload.get("best_val_perplexity")
+        self.train_start_time = time.perf_counter()
         self.loaded_resume_path = checkpoint_path
         print(json.dumps({"resume_checkpoint": checkpoint_path, "step": self.global_step, "tokens_processed": self.tokens_processed}))
 
@@ -351,6 +363,23 @@ class Trainer:
                     self.save_checkpoint(step, last_val_perplexity)
 
             self.save_checkpoint(self.global_step, tag="final")
+            if self.config.test_mode and self.tokens_processed > 0:
+                total_elapsed = max(time.perf_counter() - self.train_start_time, 1e-6)
+                avg_tokens_per_sec = self.tokens_processed / total_elapsed
+                projected_seconds = self.config.projection_target_tokens / avg_tokens_per_sec
+                print(
+                    json.dumps(
+                        {
+                            "test_mode_benchmark": True,
+                            "measured_tokens": self.tokens_processed,
+                            "avg_tokens_per_sec": round(avg_tokens_per_sec, 2),
+                            "projection_target_tokens": self.config.projection_target_tokens,
+                            "projected_hours": round(projected_seconds / 3600.0, 2),
+                            "projected_days": round(projected_seconds / 86400.0, 2),
+                            "projected_duration": _format_duration(projected_seconds),
+                        }
+                    )
+                )
         except KeyboardInterrupt:
             if self.config.checkpointing.save_on_exit and self.global_step > 0 and not self._exit_checkpoint_written:
                 self.save_checkpoint(self.global_step, tag="interrupt")
