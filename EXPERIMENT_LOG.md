@@ -116,3 +116,12 @@ Status: Not completed yet
 - Goal: reduce kernel launch overhead and make forward/backward more compiler- and GPU-friendly.
 
 Status: Implemented, benchmark pending
+
+
+#### Persistent streaming iterator fix
+- Reworked the streaming dataset to keep one live iterator open across sequences and batches.
+- Removed the per-sequence dataset rebuild that was causing repeated `Resolving data files` work.
+- Reset the live iterator cleanly on checkpoint resume.
+- Disabled datasets progress bars to avoid noisy shard-resolution output.
+
+Status: Implemented, benchmark pending

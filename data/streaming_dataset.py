@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 import torch
-from datasets import IterableDataset, load_dataset
+from datasets import IterableDataset, disable_progress_bars, load_dataset
+
+
+disable_progress_bars()
 
 
 @dataclass
@@ -44,6 +47,7 @@ class ResumablePackedDataset:
             "sequences_emitted": 0,
             "exhausted": False,
         }
+        self._record_iterator: Iterator[dict[str, str]] | None = None
 
     def state_dict(self) -> dict:
         return {
@@ -63,6 +67,7 @@ class ResumablePackedDataset:
         self.state["buffer"] = list(state.get("buffer", []))
         self.state["sequences_emitted"] = int(state.get("sequences_emitted", 0))
         self.state["exhausted"] = bool(state.get("exhausted", False))
+        self._record_iterator = None
 
     def _test_records(self) -> Iterator[dict[str, str]]:
         examples = [
@@ -86,7 +91,7 @@ class ResumablePackedDataset:
             if text:
                 yield {"text": text}
 
-    def _record_iter(self) -> Iterator[dict[str, str]]:
+    def _build_record_iter(self) -> Iterator[dict[str, str]]:
         if self.config.test_mode:
             yield from self._test_records()
             return
@@ -104,15 +109,20 @@ class ResumablePackedDataset:
                     next(source_iter)
                 except StopIteration:
                     break
+            self.state["source_index"] = source_index
             self.state["records_consumed_in_source"] = to_skip
             for record in source_iter:
-                self.state["source_index"] = source_index
                 self.state["records_consumed_in_source"] += 1
                 yield record
             self.state["source_index"] = source_index + 1
             self.state["records_consumed_in_source"] = 0
 
         self.state["exhausted"] = True
+
+    def _ensure_iterator(self) -> Iterator[dict[str, str]]:
+        if self._record_iterator is None:
+            self._record_iterator = self._build_record_iter()
+        return self._record_iterator
 
     def next_sequence(self) -> dict[str, torch.Tensor]:
         if self.state["exhausted"] and len(self.state["buffer"]) < self.sequence_length:
@@ -123,11 +133,20 @@ class ResumablePackedDataset:
             raise StopIteration
 
         buffer = list(self.state["buffer"])
-        record_iter = self._record_iter()
+        record_iter = self._ensure_iterator()
         while len(buffer) < self.sequence_length:
-            record = next(record_iter)
+            try:
+                record = next(record_iter)
+            except StopIteration:
+                self.state["exhausted"] = True
+                self._record_iterator = None
+                break
             token_ids = self.tokenizer(record[self.text_field], add_special_tokens=False)["input_ids"]
             buffer.extend(token_ids + [self.tokenizer.eos_token_id])
+
+        if len(buffer) < self.sequence_length:
+            self.state["buffer"] = buffer
+            raise StopIteration
 
         chunk = buffer[: self.sequence_length]
         self.state["buffer"] = buffer[self.sequence_length :]
