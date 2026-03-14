@@ -246,7 +246,7 @@ class Trainer:
         return dataset.next_batch(self.config.batch_size, self.device)
 
     @torch.no_grad()
-    def evaluate(self) -> float:
+    def evaluate(self) -> tuple[float, float]:
         self.model.eval()
         losses = []
         saved_val_state = self.val_dataset.state_dict()
@@ -261,8 +261,14 @@ class Trainer:
         self.val_dataset.load_state_dict(saved_val_state)
         self.model.train()
         if not losses:
-            return float("inf")
-        return math.exp(sum(losses) / len(losses))
+            return float("inf"), float("inf")
+
+        avg_loss = sum(losses) / len(losses)
+        if not math.isfinite(avg_loss):
+            return avg_loss, float("inf")
+        if avg_loss >= 80.0:
+            return avg_loss, float("inf")
+        return avg_loss, math.exp(avg_loss)
 
     def train(self) -> None:
         self.model.train()
@@ -317,9 +323,10 @@ class Trainer:
                     self.last_log_time = now
 
                 if step % self.config.val_interval == 0:
-                    last_val_perplexity = self.evaluate()
-                    self.best_val_perplexity = last_val_perplexity if self.best_val_perplexity is None else min(self.best_val_perplexity, last_val_perplexity)
-                    print(json.dumps({"step": step, "validation_perplexity": last_val_perplexity, "best_validation_perplexity": self.best_val_perplexity}))
+                    val_loss, last_val_perplexity = self.evaluate()
+                    if math.isfinite(last_val_perplexity):
+                        self.best_val_perplexity = last_val_perplexity if self.best_val_perplexity is None else min(self.best_val_perplexity, last_val_perplexity)
+                    print(json.dumps({"step": step, "validation_loss": val_loss, "validation_perplexity": last_val_perplexity, "best_validation_perplexity": self.best_val_perplexity}))
 
                 if step % self.config.checkpoint_interval == 0:
                     self.save_checkpoint(step, last_val_perplexity)
@@ -338,3 +345,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
