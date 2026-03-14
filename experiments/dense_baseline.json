@@ -1,0 +1,21 @@
+{
+  "output_dir": "outputs/dense_baseline",
+  "model": {
+    "dense_baseline": true,
+    "lora_enabled": false
+  },
+  "layer_sampling": {
+    "enabled": false,
+    "ffn_block_subsampling": false
+  },
+  "data": {
+    "sources": [
+      {
+        "path": "HuggingFaceFW/fineweb",
+        "name": "sample-10BT",
+        "split": "train",
+        "text_field": "text"
+      }
+    ]
+  }
+}

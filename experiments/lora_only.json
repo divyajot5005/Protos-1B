@@ -1,0 +1,22 @@
+{
+  "output_dir": "outputs/lora_only",
+  "model": {
+    "dense_baseline": false,
+    "lora_enabled": true,
+    "lora_rank": 16
+  },
+  "layer_sampling": {
+    "enabled": false,
+    "ffn_block_subsampling": false
+  },
+  "data": {
+    "sources": [
+      {
+        "path": "HuggingFaceFW/fineweb",
+        "name": "sample-10BT",
+        "split": "train",
+        "text_field": "text"
+      }
+    ]
+  }
+}
