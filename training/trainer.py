@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.optim import AdamW
 
 from data.streaming_dataset import DataSource, DatasetConfig, build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
 from model.transformer import CausalLMModel, ModelConfig
 from training.layer_sampler import LayerSampler, LayerSamplingConfig
+from training.runtime import build_adamw, configure_torch_runtime
 from training.schedulers import build_cosine_scheduler
 
 
@@ -113,6 +113,7 @@ class Trainer:
     def __init__(self, config: TrainingConfig, resume_path: str | None = None, auto_resume: bool = False) -> None:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        configure_torch_runtime(self.device)
         torch.manual_seed(config.seed)
         random.seed(config.seed)
 
@@ -141,11 +142,12 @@ class Trainer:
         self.layer_sampler = LayerSampler(self.config.layer_sampling, self.config.model.num_hidden_layers)
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = AdamW(
+        self.optimizer = build_adamw(
             trainable_params,
             lr=self.config.optimizer.lr,
             betas=self.config.optimizer.betas,
             weight_decay=self.config.optimizer.weight_decay,
+            device=self.device,
         )
         self.scheduler = build_cosine_scheduler(self.optimizer, self.config.warmup_steps, self.config.max_steps)
         self.autocast_dtype = torch.bfloat16 if self.config.bf16 and self.device.type == "cuda" else torch.float32

@@ -10,6 +10,7 @@ import torch
 from data.streaming_dataset import build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
 from model.transformer import CausalLMModel
+from training.runtime import build_adamw, configure_torch_runtime
 from training.trainer import TrainingConfig, load_training_config
 
 
@@ -45,11 +46,12 @@ def timed_fetch(dataset, batch_size: int, device: torch.device):
     return batch, now() - start
 
 
-def timed_step(model, optimizer, batch, device: torch.device):
+def timed_step(model, optimizer, batch, device: torch.device, autocast_dtype: torch.dtype | None):
     stats = {}
 
     start = now()
-    output = model(batch["input_ids"], labels=batch["labels"])
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=device.type == "cuda" and autocast_dtype is not None):
+        output = model(batch["input_ids"], labels=batch["labels"])
     sync(device)
     stats["forward_seconds"] = now() - start
 
@@ -104,6 +106,8 @@ def main():
     args = parse_args()
     config: TrainingConfig = configure(load_training_config(args.config), args)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    configure_torch_runtime(device)
+    autocast_dtype = torch.bfloat16 if device.type == "cuda" else None
 
     tokenizer = load_qwen_tokenizer(config.tokenizer_name)
     config.model.vocab_size = len(tokenizer)
@@ -114,7 +118,7 @@ def main():
         model = torch.compile(model)
     model.train()
 
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.optimizer.lr)
+    optimizer = build_adamw([p for p in model.parameters() if p.requires_grad], lr=config.optimizer.lr, betas=config.optimizer.betas, weight_decay=config.optimizer.weight_decay, device=device)
 
     fetch_times = []
     forward_times = []
@@ -127,7 +131,7 @@ def main():
     for step_idx in range(total_steps):
         batch, fetch_seconds = timed_fetch(dataset, args.batch_size, device)
         optimizer.zero_grad(set_to_none=True)
-        step_stats = timed_step(model, optimizer, batch, device)
+        step_stats = timed_step(model, optimizer, batch, device, autocast_dtype)
 
         if step_idx >= args.warmup_steps:
             fetch_times.append(fetch_seconds)

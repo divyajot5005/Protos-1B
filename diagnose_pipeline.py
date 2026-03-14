@@ -10,6 +10,7 @@ import torch
 from data.streaming_dataset import build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
 from model.transformer import CausalLMModel
+from training.runtime import build_adamw, configure_torch_runtime
 from training.trainer import TrainingConfig, load_training_config
 
 
@@ -36,12 +37,13 @@ def measure_batch_fetch(dataset, batch_size: int, device: torch.device, num_batc
 
 
 def measure_train_step(model, batch, num_steps: int = 3) -> list[float]:
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+    optimizer = build_adamw([p for p in model.parameters() if p.requires_grad], lr=1e-4, betas=(0.9, 0.95), weight_decay=0.1, device=batch["input_ids"].device)
     durations = []
     for _ in range(num_steps):
         optimizer.zero_grad(set_to_none=True)
         start = time.perf_counter()
-        output = model(batch["input_ids"], labels=batch["labels"])
+        with torch.autocast(device_type=batch["input_ids"].device.type, dtype=torch.bfloat16, enabled=batch["input_ids"].device.type == "cuda"):
+            output = model(batch["input_ids"], labels=batch["labels"])
         output["loss"].backward()
         optimizer.step()
         if batch["input_ids"].device.type == "cuda":
@@ -59,6 +61,7 @@ def main():
         config.data.max_samples = max(config.data.max_samples or 0, args.batch_size * args.num_batches * 2)
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    configure_torch_runtime(device)
 
     overall_start = time.perf_counter()
 
