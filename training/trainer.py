@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import shutil
 import signal
@@ -69,10 +70,22 @@ def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any
     return base
 
 
+DEFAULT_PROJECT_ROOT = Path("/root/Protos-1B")
+PROJECT_ROOT = Path(os.environ.get("PROTOS_PROJECT_ROOT", str(DEFAULT_PROJECT_ROOT))).resolve()
+
+
+def _resolve_project_path(path_str: str | None) -> Path | None:
+    if path_str is None:
+        return None
+    path = Path(path_str)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def load_training_config(config_path: str | None) -> TrainingConfig:
     config = asdict(TrainingConfig())
     if config_path:
-        with open(config_path, "r", encoding="utf-8") as handle:
+        resolved_config_path = _resolve_project_path(config_path)
+        with open(resolved_config_path, "r", encoding="utf-8") as handle:
             file_config = json.load(handle)
         config = _deep_update(config, file_config)
 
@@ -99,7 +112,7 @@ class Trainer:
             self.config.layer_sampling.ffn_block_subsampling = False
         self.config.layer_sampling.total_ffn_blocks = self.config.model.ffn_num_blocks
 
-        self.output_dir = Path(self.config.output_dir)
+        self.output_dir = _resolve_project_path(self.config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -137,11 +150,11 @@ class Trainer:
         with open(self.output_dir / "resolved_config.json", "w", encoding="utf-8") as handle:
             json.dump(asdict(self.config), handle, indent=2)
 
-        candidate_resume = resume_path
+        candidate_resume = _resolve_project_path(resume_path)
         if candidate_resume is None and auto_resume and self.latest_checkpoint_path.exists():
-            candidate_resume = str(self.latest_checkpoint_path)
+            candidate_resume = self.latest_checkpoint_path
         if candidate_resume is not None:
-            self.resume(candidate_resume)
+            self.resume(str(candidate_resume))
 
         self._register_signal_handlers()
 
@@ -345,4 +358,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

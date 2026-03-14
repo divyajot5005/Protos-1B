@@ -23,10 +23,10 @@ python train.py --config experiments/lora_layer_sampling_ffn.json --test-mode --
 
 ```bash
 python train.py --config experiments/lora_layer_sampling_ffn.json --auto-resume
-python train.py --config experiments/lora_layer_sampling_ffn.json --resume outputs/lora_layer_sampling_ffn/latest.pt
+python train.py --config experiments/lora_layer_sampling_ffn.json --resume /root/Protos-1B/outputs/lora_layer_sampling_ffn/latest.pt
 ```
 
-Checkpoints now store model weights, optimizer state, scheduler state, RNG state, token counts, and the packed streaming-dataset cursor so restarted jobs continue from the same training position.
+Checkpoints now store model weights, optimizer state, scheduler state, RNG state, token counts, and the packed streaming-dataset cursor so restarted jobs continue from the same training position. Relative config, output, and resume paths are resolved under `/root/Protos-1B` by default.
 
 ## Notes
 
@@ -34,3 +34,4 @@ Checkpoints now store model weights, optimizer state, scheduler state, RNG state
 - Streaming datasets keep local storage low, but the first real run will require network access to Hugging Face.
 - `torch.nn.functional.scaled_dot_product_attention` is used so PyTorch can route to FlashAttention kernels on H100 when available.
 "# Protos-1B" 
+
