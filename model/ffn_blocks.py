@@ -51,6 +51,7 @@ class TensorizedParallelFFN(nn.Module):
             self.down_lora_b = None
             self.lora_dropout = nn.Identity()
 
+        self._index_cache: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
         self.reset_parameters()
         self._set_base_trainable(self.train_base)
 
@@ -87,7 +88,11 @@ class TensorizedParallelFFN(nn.Module):
     def _select_blocks(self, tensor: torch.Tensor, block_indices: list[int]) -> torch.Tensor:
         if len(block_indices) == self.num_blocks:
             return tensor
-        index = torch.tensor(block_indices, device=tensor.device, dtype=torch.long)
+        cache_key = (tensor.device, tuple(block_indices))
+        index = self._index_cache.get(cache_key)
+        if index is None:
+            index = torch.tensor(block_indices, device=tensor.device, dtype=torch.long)
+            self._index_cache[cache_key] = index
         return tensor.index_select(0, index)
 
     def _project_input(

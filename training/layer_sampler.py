@@ -24,7 +24,7 @@ class LayerSampler:
 
     def build_context(self, global_step: int) -> ForwardContext:
         if not self.config.enabled:
-            return ForwardContext(active_layers=None, full_update=True, scale_ffn_outputs=False)
+            return ForwardContext(active_layers=None, active_layer_flags=None, full_update=True, scale_ffn_outputs=False)
 
         full_update = global_step > 0 and global_step % self.config.full_update_interval == 0
         active_layers = set(range(self.total_layers)) if full_update else set(
@@ -39,8 +39,10 @@ class LayerSampler:
                     random.sample(range(self.config.total_ffn_blocks), k=min(num_blocks, self.config.total_ffn_blocks))
                 )
 
+        active_layer_flags = tuple(layer_idx in active_layers for layer_idx in range(self.total_layers))
         return ForwardContext(
             active_layers=active_layers,
+            active_layer_flags=active_layer_flags,
             full_update=full_update,
             active_ffn_blocks=active_ffn_blocks,
             scale_ffn_outputs=self.config.ffn_block_subsampling and not full_update,

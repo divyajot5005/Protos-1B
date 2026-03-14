@@ -51,6 +51,7 @@ class ModelConfig:
 @dataclass
 class ForwardContext:
     active_layers: set[int] | None = None
+    active_layer_flags: tuple[bool, ...] | None = None
     full_update: bool = False
     active_ffn_blocks: dict[int, list[int]] = field(default_factory=dict)
     scale_ffn_outputs: bool = False
@@ -96,7 +97,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor, block_index: int, ctx: ForwardContext | None = None) -> tuple[torch.Tensor, list[int]]:
         ctx = ctx or ForwardContext()
-        layer_active = ctx.full_update or ctx.active_layers is None or block_index in ctx.active_layers
+        layer_active = ctx.full_update or ctx.active_layer_flags is None or ctx.active_layer_flags[block_index]
         active_blocks = ctx.active_ffn_blocks.get(block_index)
 
         if self.training and not layer_active:

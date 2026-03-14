@@ -125,3 +125,51 @@ Status: Implemented, benchmark pending
 - Disabled datasets progress bars to avoid noisy shard-resolution output.
 
 Status: Implemented, benchmark pending
+
+
+#### Runtime-tuned compute diagnosis
+- Re-ran compute diagnosis after enabling bf16 autocast, TF32/high matmul precision, SDPA backend toggles, fused AdamW, and `torch.compile`.
+- Sparse mode, batch size 4, test mode, compile on:
+  - `forward_seconds`: about 0.106s before FFN tensorization
+  - `backward_seconds`: about 0.163s before FFN tensorization
+  - `tokens_per_sec`: about 26.9k
+- Conclusion: runtime/kernel tuning alone produced a major jump and made the compute path viable on H100.
+
+Status: Success
+
+#### Tensorized FFN benchmark result
+- Re-ran compute diagnosis after tensorizing the FFN block path.
+- Sparse mode, batch size 4, test mode, compile on:
+  - `forward_seconds`: about 0.078s
+  - `backward_seconds`: about 0.116s
+  - `avg_total_step_seconds`: about 0.220s
+  - `tokens_per_sec`: about 37.3k
+- Compared with the pre-tensorized compiled result, throughput improved by roughly 39%.
+- Conclusion: FFN Python/module overhead was a major remaining compute bottleneck and tensorization helped substantially.
+
+Status: Success
+
+#### Real-data training after persistent iterator fix
+- Re-ran real training with compile on, batch size 4, grad accumulation 1.
+- The repeated `Resolving data files` spam disappeared after switching to a persistent streaming iterator.
+- Throughput observations:
+  - early warmup/compile step at step 10: about 361 tok/s
+  - stabilized throughput by step 20: about 44.4k tok/s
+- Conclusion: the real-data bottleneck was caused by per-sequence stream rebuilds, and fixing the iterator unlocked end-to-end throughput close to the compute-only path.
+
+Status: Success
+
+#### Remaining issues after throughput recovery
+- `torch.compile` still hits the recompile limit because `forward_context.active_layers` is a Python `set` used in the model forward path.
+- The run ended with `terminate called without an active exception` after finishing the short benchmark run, likely during shutdown/teardown rather than the actual training step.
+
+Status: Open
+
+#### Updated takeaways
+- End-to-end real training is now in the ~44k tok/s range on 1x H100 for the short run tested.
+- Major wins came from:
+  - persistent streaming iterator
+  - bf16/TF32/runtime tuning
+  - fused AdamW
+  - tensorized FFN path
+- The next likely optimization target is reducing compile recompilations from dynamic layer selection.
