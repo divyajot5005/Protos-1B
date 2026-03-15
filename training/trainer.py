@@ -356,7 +356,10 @@ class Trainer:
         self.global_step = int(payload.get("step", 0))
         self.tokens_processed = int(payload.get("tokens_processed", 0))
         self.best_val_perplexity = payload.get("best_val_perplexity")
-        self._pending_train_batches = payload.get("train_prefetch_buffer", [])
+        self._pending_train_batches = [
+            {key: value.detach().cpu() for key, value in batch.items()}
+            for batch in payload.get("train_prefetch_buffer", [])
+        ]
         self.train_start_time = time.perf_counter()
         self.loaded_resume_path = checkpoint_path
         print(json.dumps({"resume_checkpoint": checkpoint_path, "step": self.global_step, "tokens_processed": self.tokens_processed}))
