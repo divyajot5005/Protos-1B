@@ -388,10 +388,6 @@ class Trainer:
             for step in range(self.global_step + 1, self.config.max_steps + 1):
                 step_loss = 0.0
                 ctx = self.layer_sampler.build_context(step)
-                if ctx.active_layer_flags is None:
-                    ctx.active_layer_mask = torch.ones(self.config.model.num_hidden_layers, device=self.device, dtype=torch.float32)
-                else:
-                    ctx.active_layer_mask = torch.tensor(ctx.active_layer_flags, device=self.device, dtype=torch.float32)
                 self.model.set_active_lora_layers(ctx.active_layers, ctx.full_update)
                 last_block_usage: dict[int, list[int]] = {}
                 last_val_perplexity = None

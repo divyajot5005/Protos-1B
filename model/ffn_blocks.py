@@ -85,7 +85,7 @@ class TensorizedParallelFFN(nn.Module):
             for param in (self.gate_lora_b, self.up_lora_b, self.down_lora_b):
                 nn.init.zeros_(param)
 
-    def _select_blocks(self, tensor: torch.Tensor, block_indices: list[int]) -> torch.Tensor:
+    def _select_blocks(self, tensor: torch.Tensor, block_indices: tuple[int, ...] | list[int]) -> torch.Tensor:
         if len(block_indices) == self.num_blocks:
             return tensor
         cache_key = (tensor.device, tuple(block_indices))
@@ -124,8 +124,15 @@ class TensorizedParallelFFN(nn.Module):
             output = output + delta * self.lora_config.scaling
         return output
 
-    def forward(self, x: torch.Tensor, active_block_indices: list[int] | None = None, scale_outputs: bool = False) -> tuple[torch.Tensor, list[int]]:
-        block_indices = active_block_indices or list(range(self.num_blocks))
+    def forward(
+        self,
+        x: torch.Tensor,
+        active_block_indices: tuple[int, ...] | list[int] | None = None,
+        active_block_mask: tuple[bool, ...] | list[bool] | None = None,
+        scale_outputs: bool = False,
+    ) -> tuple[torch.Tensor, list[int]]:
+        block_indices = tuple(active_block_indices) if active_block_indices is not None else tuple(range(self.num_blocks))
+        block_mask = tuple(active_block_mask) if active_block_mask is not None else tuple(True for _ in block_indices)
 
         gate_weight = self._select_blocks(self.gate_weight, block_indices)
         up_weight = self._select_blocks(self.up_weight, block_indices)
@@ -142,10 +149,15 @@ class TensorizedParallelFFN(nn.Module):
         up = self._project_input(x, up_weight, up_lora_a, up_lora_b)
         hidden = gated * up
         down = self._project_output(hidden, down_weight, down_lora_a, down_lora_b)
+        if active_block_mask is not None:
+            mask = torch.tensor(block_mask, device=x.device, dtype=down.dtype).view(1, 1, -1, 1)
+            down = down * mask
         combined = down.sum(dim=2)
-        if scale_outputs and len(block_indices) > 0:
-            combined = combined * (self.num_blocks / len(block_indices))
-        return combined, block_indices
+        valid_block_count = max(1, sum(block_mask))
+        if scale_outputs:
+            combined = combined * (self.num_blocks / valid_block_count)
+        used_blocks = [block_idx for block_idx, is_active in zip(block_indices, block_mask) if is_active]
+        return combined, used_blocks
 
 
 ParallelFFN = TensorizedParallelFFN

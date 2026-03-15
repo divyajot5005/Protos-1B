@@ -52,9 +52,9 @@ class ModelConfig:
 class ForwardContext:
     active_layers: set[int] | None = None
     active_layer_flags: tuple[bool, ...] | None = None
-    active_layer_mask: torch.Tensor | None = None
     full_update: bool = False
-    active_ffn_blocks: dict[int, list[int]] = field(default_factory=dict)
+    active_ffn_block_indices: tuple[tuple[int, ...], ...] = ()
+    active_ffn_block_mask: tuple[tuple[bool, ...], ...] = ()
     scale_ffn_outputs: bool = False
 
 
@@ -98,21 +98,34 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor, block_index: int, ctx: ForwardContext | None = None) -> tuple[torch.Tensor, list[int]]:
         ctx = ctx or ForwardContext()
-        active_blocks = ctx.active_ffn_blocks.get(block_index)
-        layer_scale = None
-        if ctx.active_layer_mask is not None:
-            layer_scale = ctx.active_layer_mask[block_index].to(device=x.device, dtype=x.dtype)
+        layer_active = ctx.full_update or ctx.active_layer_flags is None or ctx.active_layer_flags[block_index]
+        active_block_indices = None
+        active_block_mask = None
+        if ctx.active_ffn_block_indices:
+            active_block_indices = ctx.active_ffn_block_indices[block_index]
+            active_block_mask = ctx.active_ffn_block_mask[block_index] if ctx.active_ffn_block_mask else None
+
+        if self.training and not layer_active:
+            with torch.no_grad():
+                attn_out = self.attention(self.attn_norm(x), position_ids)
+                x = x + attn_out
+                ffn_out, used_blocks = self.ffn(
+                    self.ffn_norm(x),
+                    active_block_indices=active_block_indices,
+                    active_block_mask=active_block_mask,
+                    scale_outputs=ctx.scale_ffn_outputs,
+                )
+                x = x + ffn_out
+            return x, used_blocks
 
         attn_out = self.attention(self.attn_norm(x), position_ids)
-        if self.training and layer_scale is not None:
-            inactive_scale = 1.0 - layer_scale
-            attn_out = (attn_out * layer_scale) + (attn_out.detach() * inactive_scale)
         x = x + attn_out
-
-        ffn_out, used_blocks = self.ffn(self.ffn_norm(x), active_blocks, ctx.scale_ffn_outputs)
-        if self.training and layer_scale is not None:
-            inactive_scale = 1.0 - layer_scale
-            ffn_out = (ffn_out * layer_scale) + (ffn_out.detach() * inactive_scale)
+        ffn_out, used_blocks = self.ffn(
+            self.ffn_norm(x),
+            active_block_indices=active_block_indices,
+            active_block_mask=active_block_mask,
+            scale_outputs=ctx.scale_ffn_outputs,
+        )
         x = x + ffn_out
         return x, used_blocks
 

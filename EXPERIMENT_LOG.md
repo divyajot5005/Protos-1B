@@ -200,19 +200,3 @@ Status: Success
 - Goal: stop Dynamo recompiles caused by changing `len(active_ffn_blocks[layer])` while preserving sparse FFN execution.
 
 Status: Implemented, benchmark pending
-
-
-#### Reverted fixed-width FFN routing
-- Reverted the padded fixed-width FFN routing representation.
-- The change moved the Dynamo recompile from FFN block-count specialization to dynamic layer flags and reduced end-to-end throughput from roughly `49-50k tok/s` to roughly `47k tok/s`.
-- Restored the previous variable-length FFN routing path because it performed better in practice.
-
-Status: Reverted after regression
-
-
-#### Layer-activity branch removal
-- Replaced the per-layer Python `if self.training and not layer_active` branch with a tensor-gated detach path.
-- Trainer now prepares a per-step `active_layer_mask` tensor on the target device and passes it through the forward context.
-- Goal: keep one compiled forward path while still blocking gradients for inactive layers.
-
-Status: Implemented, benchmark pending
