@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import random
 import shutil
 import signal
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -60,6 +62,7 @@ class TrainingConfig:
     seed: int = 7
     test_mode: bool = False
     projection_target_tokens: int = 200_000_000_000
+    train_prefetch_steps: int = 1000
 
 
 def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -109,6 +112,65 @@ def _format_duration(seconds: float) -> str:
     return f"{days}d {hours}h {minutes}m"
 
 
+class BackgroundBatchPrefetcher:
+    _STOP = object()
+
+    def __init__(self, dataset, batch_size: int, device: torch.device, max_prefetch_steps: int, initial_batches: list[dict[str, torch.Tensor]] | None = None) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.device = device
+        self.cpu_device = torch.device("cpu")
+        self.queue: queue.Queue = queue.Queue(maxsize=max_prefetch_steps)
+        self.stop_event = threading.Event()
+        self.worker_error: Exception | None = None
+        self.end_of_stream = False
+
+        for batch in initial_batches or []:
+            self.queue.put(self._pin_batch(batch))
+
+        self.thread = threading.Thread(target=self._worker_loop, name="train-prefetch", daemon=True)
+        self.thread.start()
+
+    def _pin_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        pinned = {}
+        for key, value in batch.items():
+            pinned[key] = value.pin_memory() if self.device.type == "cuda" and hasattr(value, "pin_memory") else value
+        return pinned
+
+    def _worker_loop(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                batch = self.dataset.next_batch(self.batch_size, self.cpu_device)
+                self.queue.put(self._pin_batch(batch))
+        except StopIteration:
+            self.end_of_stream = True
+            self.queue.put(self._STOP)
+        except Exception as exc:
+            self.worker_error = exc
+            self.queue.put(self._STOP)
+
+    def get(self) -> dict[str, torch.Tensor]:
+        item = self.queue.get()
+        if item is self._STOP:
+            if self.worker_error is not None:
+                raise self.worker_error
+            raise StopIteration
+        if self.device.type == "cuda":
+            return {key: value.to(self.device, non_blocking=True) for key, value in item.items()}
+        return item
+
+    def snapshot(self) -> list[dict[str, torch.Tensor]]:
+        with self.queue.mutex:
+            items = [item for item in list(self.queue.queue) if item is not self._STOP]
+        return [
+            {key: value.detach().cpu() for key, value in batch.items()}
+            for batch in items
+        ]
+
+    def close(self) -> None:
+        self.stop_event.set()
+
+
 class Trainer:
     def __init__(self, config: TrainingConfig, resume_path: str | None = None, auto_resume: bool = False) -> None:
         self.config = config
@@ -140,6 +202,8 @@ class Trainer:
         self.train_dataset = build_streaming_dataset(self.config.data, self.tokenizer, validation=False)
         self.val_dataset = build_streaming_dataset(self.config.data, self.tokenizer, validation=True)
         self.layer_sampler = LayerSampler(self.config.layer_sampling, self.config.model.num_hidden_layers)
+        self._pending_train_batches: list[dict[str, torch.Tensor]] = []
+        self.train_prefetcher: BackgroundBatchPrefetcher | None = None
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = build_adamw(
@@ -168,6 +232,14 @@ class Trainer:
             candidate_resume = self.latest_checkpoint_path
         if candidate_resume is not None:
             self.resume(str(candidate_resume))
+
+        self.train_prefetcher = BackgroundBatchPrefetcher(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            device=self.device,
+            max_prefetch_steps=self.config.train_prefetch_steps,
+            initial_batches=self._pending_train_batches,
+        )
 
         self._register_signal_handlers()
 
@@ -221,6 +293,7 @@ class Trainer:
             "model": self.model.state_dict(),
             "train_dataset": self.train_dataset.state_dict(),
             "val_dataset": self.val_dataset.state_dict(),
+            "train_prefetch_buffer": self.train_prefetcher.snapshot() if self.train_prefetcher is not None else [],
         }
         if self.config.checkpointing.save_optimizer_state:
             payload["optimizer"] = self.optimizer.state_dict()
@@ -270,11 +343,14 @@ class Trainer:
         self.global_step = int(payload.get("step", 0))
         self.tokens_processed = int(payload.get("tokens_processed", 0))
         self.best_val_perplexity = payload.get("best_val_perplexity")
+        self._pending_train_batches = payload.get("train_prefetch_buffer", [])
         self.train_start_time = time.perf_counter()
         self.loaded_resume_path = checkpoint_path
         print(json.dumps({"resume_checkpoint": checkpoint_path, "step": self.global_step, "tokens_processed": self.tokens_processed}))
 
     def _next_batch(self, split: str) -> dict[str, torch.Tensor]:
+        if split == "train" and self.train_prefetcher is not None:
+            return self.train_prefetcher.get()
         dataset = self.train_dataset if split == "train" else self.val_dataset
         return dataset.next_batch(self.config.batch_size, self.device)
 
@@ -387,6 +463,9 @@ class Trainer:
                 self.save_checkpoint(self.global_step, tag="interrupt")
                 self._exit_checkpoint_written = True
             raise
+        finally:
+            if self.train_prefetcher is not None:
+                self.train_prefetcher.close()
 
 
 def main() -> int:

@@ -173,3 +173,12 @@ Status: Open
   - fused AdamW
   - tensorized FFN path
 - The next likely optimization target is reducing compile recompilations from dynamic layer selection.
+
+
+#### Background RAM prefetch buffer
+- Added a background training-batch prefetcher with a default 1000-step RAM buffer.
+- Training now consumes prefetched CPU batches while a daemon worker streams, tokenizes, and packs future batches in the background.
+- Prefetched batches are pinned in memory for faster GPU transfer.
+- Checkpoints now snapshot unread prefetched batches so resume does not silently skip buffered data.
+
+Status: Implemented, benchmark pending
