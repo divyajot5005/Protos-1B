@@ -112,6 +112,19 @@ def _format_duration(seconds: float) -> str:
     return f"{days}d {hours}h {minutes}m"
 
 
+def _is_transient_data_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    transient_markers = (
+        "temporary failure in name resolution",
+        "client has been closed",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
 class BackgroundBatchPrefetcher:
     _STOP = object()
 
@@ -364,6 +377,13 @@ class Trainer:
                 batch = self._next_batch("val")
             except StopIteration:
                 break
+            except Exception as exc:
+                self.val_dataset.load_state_dict(saved_val_state)
+                self.model.train()
+                if _is_transient_data_error(exc):
+                    tqdm.write(json.dumps({"validation_skipped": True, "reason": str(exc)}))
+                    return float("inf"), float("inf")
+                raise
             with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.device.type == "cuda"):
                 output = self.model(batch["input_ids"], labels=batch["labels"])
             losses.append(output["loss"].item())
