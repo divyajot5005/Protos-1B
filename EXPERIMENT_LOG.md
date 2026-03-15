@@ -182,21 +182,3 @@ Status: Open
 - Checkpoints now snapshot unread prefetched batches so resume does not silently skip buffered data.
 
 Status: Implemented, benchmark pending
-
-
-#### Flash attention confirmation and latest throughput
-- Verified with `torch.profiler` on H100 that PyTorch SDPA is dispatching to flash attention kernels:
-  - `aten::_scaled_dot_product_flash_attention`
-  - `aten::_flash_attention_forward`
-  - `pytorch_flash::flash_fwd_kernel`
-- Short real-data training run with compile on reached about `49.0k tok/s` by step 20.
-- Flash attention is active in practice, but `torch.compile` still recompiles because FFN block routing is represented as variable-length Python lists.
-
-Status: Success
-
-#### Fixed-width FFN routing for compile stability
-- Replaced per-layer variable-length FFN block lists in the forward context with fixed-width padded block index tuples plus a matching boolean mask.
-- The FFN module now consumes a stable-shape routing representation and masks padded slots instead of relying on variable-length selections.
-- Goal: stop Dynamo recompiles caused by changing `len(active_ffn_blocks[layer])` while preserving sparse FFN execution.
-
-Status: Implemented, benchmark pending
