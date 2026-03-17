@@ -182,3 +182,12 @@ Status: Open
 - Checkpoints now snapshot unread prefetched batches so resume does not silently skip buffered data.
 
 Status: Implemented, benchmark pending
+
+
+#### Dense-to-LoRA staged training script
+- Added `train_dense_then_lora.py`.
+- Stage 1 runs a dense/full-update bootstrap phase until validation loss reaches a target threshold.
+- Stage 2 starts a fresh sparse LoRA optimizer/scheduler while loading model weights and dataset progress from the dense checkpoint.
+- Added trainer support for `stop_at_val_loss` and non-optimizer stage checkpoint loading.
+
+Status: Implemented, benchmark pending

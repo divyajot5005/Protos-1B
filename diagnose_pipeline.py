@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 from data.streaming_dataset import build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
@@ -26,7 +27,7 @@ def parse_args():
 
 def measure_batch_fetch(dataset, batch_size: int, device: torch.device, num_batches: int) -> list[float]:
     durations = []
-    for _ in range(num_batches):
+    for _ in tqdm(range(num_batches), desc="fetch", dynamic_ncols=True):
         start = time.perf_counter()
         batch = dataset.next_batch(batch_size, device)
         if device.type == "cuda":
@@ -39,7 +40,7 @@ def measure_batch_fetch(dataset, batch_size: int, device: torch.device, num_batc
 def measure_train_step(model, batch, num_steps: int = 3) -> list[float]:
     optimizer = build_adamw([p for p in model.parameters() if p.requires_grad], lr=1e-4, betas=(0.9, 0.95), weight_decay=0.1, device=batch["input_ids"].device)
     durations = []
-    for _ in range(num_steps):
+    for _ in tqdm(range(num_steps), desc="train", dynamic_ncols=True):
         optimizer.zero_grad(set_to_none=True)
         start = time.perf_counter()
         with torch.autocast(device_type=batch["input_ids"].device.type, dtype=torch.bfloat16, enabled=batch["input_ids"].device.type == "cuda"):
@@ -111,7 +112,7 @@ def main():
         hints.append("model_step_itself_is_nontrivial")
     diagnosis["hints"] = hints
 
-    print(json.dumps(diagnosis, indent=2))
+    tqdm.write(json.dumps(diagnosis, indent=2))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 
 from data.streaming_dataset import DataSource, DatasetConfig, build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
@@ -63,6 +64,7 @@ class TrainingConfig:
     test_mode: bool = False
     projection_target_tokens: int = 200_000_000_000
     train_prefetch_steps: int = 1000
+    stop_at_val_loss: float | None = None
 
 
 def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -172,9 +174,14 @@ class BackgroundBatchPrefetcher:
             return {key: value.to(self.device, non_blocking=True) for key, value in item.items()}
         return item
 
-    def snapshot(self) -> list[dict[str, torch.Tensor]]:
+    def qsize(self) -> int:
+        return self.queue.qsize()
+
+    def snapshot(self, limit: int | None = None) -> list[dict[str, torch.Tensor]]:
         with self.queue.mutex:
             items = [item for item in list(self.queue.queue) if item is not self._STOP]
+        if limit is not None:
+            items = items[:limit]
         return [
             {key: value.detach().cpu() for key, value in batch.items()}
             for batch in items
@@ -185,6 +192,31 @@ class BackgroundBatchPrefetcher:
 
 
 class Trainer:
+    PREFETCH_CHECKPOINT_LIMIT = 10
+
+    def _build_optimizer_and_scheduler(self) -> None:
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = build_adamw(
+            trainable_params,
+            lr=self.config.optimizer.lr,
+            betas=self.config.optimizer.betas,
+            weight_decay=self.config.optimizer.weight_decay,
+            device=self.device,
+        )
+        self.scheduler = build_cosine_scheduler(self.optimizer, self.config.warmup_steps, self.config.max_steps)
+
+    def _start_train_prefetcher(self) -> None:
+        if self.train_prefetcher is not None:
+            self.train_prefetcher.close()
+        self.train_prefetcher = BackgroundBatchPrefetcher(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            device=self.device,
+            max_prefetch_steps=self.config.train_prefetch_steps,
+            initial_batches=self._pending_train_batches,
+        )
+        self._pending_train_batches = []
+
     def __init__(self, config: TrainingConfig, resume_path: str | None = None, auto_resume: bool = False) -> None:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -218,15 +250,7 @@ class Trainer:
         self._pending_train_batches: list[dict[str, torch.Tensor]] = []
         self.train_prefetcher: BackgroundBatchPrefetcher | None = None
 
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = build_adamw(
-            trainable_params,
-            lr=self.config.optimizer.lr,
-            betas=self.config.optimizer.betas,
-            weight_decay=self.config.optimizer.weight_decay,
-            device=self.device,
-        )
-        self.scheduler = build_cosine_scheduler(self.optimizer, self.config.warmup_steps, self.config.max_steps)
+        self._build_optimizer_and_scheduler()
         self.autocast_dtype = torch.bfloat16 if self.config.bf16 and self.device.type == "cuda" else torch.float32
 
         self.global_step = 0
@@ -235,6 +259,10 @@ class Trainer:
         self.last_log_time = time.perf_counter()
         self.train_start_time = time.perf_counter()
         self.loaded_resume_path: str | None = None
+        self.last_checkpoint_path: str | None = None
+        self.last_validation_loss: float | None = None
+        self.last_validation_perplexity: float | None = None
+        self.stop_reason: str | None = None
         self._exit_checkpoint_written = False
 
         with open(self.output_dir / "resolved_config.json", "w", encoding="utf-8") as handle:
@@ -246,13 +274,7 @@ class Trainer:
         if candidate_resume is not None:
             self.resume(str(candidate_resume))
 
-        self.train_prefetcher = BackgroundBatchPrefetcher(
-            self.train_dataset,
-            batch_size=self.config.batch_size,
-            device=self.device,
-            max_prefetch_steps=self.config.train_prefetch_steps,
-            initial_batches=self._pending_train_batches,
-        )
+        self._start_train_prefetcher()
 
         self._register_signal_handlers()
 
@@ -268,7 +290,7 @@ class Trainer:
         if self.config.checkpointing.save_on_exit and self.global_step > 0 and not self._exit_checkpoint_written:
             self.save_checkpoint(self.global_step, tag=signal_name.lower())
             self._exit_checkpoint_written = True
-        print(json.dumps({"signal": signal_name, "step": self.global_step, "checkpoint_saved": self._exit_checkpoint_written}))
+        tqdm.write(json.dumps({"signal": signal_name, "step": self.global_step, "checkpoint_saved": self._exit_checkpoint_written}))
         raise KeyboardInterrupt
 
     def _capture_rng_state(self) -> dict[str, Any]:
@@ -306,7 +328,7 @@ class Trainer:
             "model": self.model.state_dict(),
             "train_dataset": self.train_dataset.state_dict(),
             "val_dataset": self.val_dataset.state_dict(),
-            "train_prefetch_buffer": self.train_prefetcher.snapshot() if self.train_prefetcher is not None else [],
+            "train_prefetch_buffer": self.train_prefetcher.snapshot(self.PREFETCH_CHECKPOINT_LIMIT) if self.train_prefetcher is not None else [],
         }
         if self.config.checkpointing.save_optimizer_state:
             payload["optimizer"] = self.optimizer.state_dict()
@@ -333,6 +355,7 @@ class Trainer:
         torch.save(self._checkpoint_payload(step, last_val_perplexity), checkpoint_path)
         self._save_latest_alias(checkpoint_path)
         self._cleanup_old_checkpoints()
+        self.last_checkpoint_path = str(checkpoint_path)
         meta = {
             "latest_checkpoint": str(checkpoint_path),
             "step": step,
@@ -362,7 +385,33 @@ class Trainer:
         ]
         self.train_start_time = time.perf_counter()
         self.loaded_resume_path = checkpoint_path
-        print(json.dumps({"resume_checkpoint": checkpoint_path, "step": self.global_step, "tokens_processed": self.tokens_processed}))
+        tqdm.write(json.dumps({"resume_checkpoint": checkpoint_path, "step": self.global_step, "tokens_processed": self.tokens_processed}))
+
+    def load_stage_checkpoint(self, checkpoint_path: str) -> None:
+        payload = torch.load(checkpoint_path, map_location=self.device)
+        missing_keys, unexpected_keys = self.model.load_state_dict(payload["model"], strict=False)
+        self.train_dataset.load_state_dict(payload.get("train_dataset"))
+        self.val_dataset.load_state_dict(payload.get("val_dataset"))
+        self._restore_rng_state(payload.get("rng_state"))
+        self.global_step = int(payload.get("step", 0))
+        self.tokens_processed = int(payload.get("tokens_processed", 0))
+        self.best_val_perplexity = payload.get("best_val_perplexity")
+        self._pending_train_batches = [
+            {key: value.detach().cpu() for key, value in batch.items()}
+            for batch in payload.get("train_prefetch_buffer", [])
+        ]
+        self.loaded_resume_path = checkpoint_path
+        self.last_checkpoint_path = checkpoint_path
+        self.train_start_time = time.perf_counter()
+        self._build_optimizer_and_scheduler()
+        self._start_train_prefetcher()
+        tqdm.write(json.dumps({
+            "stage_checkpoint": checkpoint_path,
+            "step": self.global_step,
+            "tokens_processed": self.tokens_processed,
+            "missing_keys": len(missing_keys),
+            "unexpected_keys": len(unexpected_keys),
+        }))
 
     def _next_batch(self, split: str) -> dict[str, torch.Tensor]:
         if split == "train" and self.train_prefetcher is not None:
@@ -406,17 +455,21 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         self.last_log_time = time.perf_counter()
+        progress = tqdm(total=self.config.max_steps, initial=self.global_step, desc="train", dynamic_ncols=True)
 
         try:
             for step in range(self.global_step + 1, self.config.max_steps + 1):
                 step_loss = 0.0
+                fetch_wait_seconds = 0.0
                 ctx = self.layer_sampler.build_context(step)
                 self.model.set_active_lora_layers(ctx.active_layers, ctx.full_update)
                 last_block_usage: dict[int, list[int]] = {}
                 last_val_perplexity = None
 
                 for _ in range(self.config.grad_accum_steps):
+                    fetch_start = time.perf_counter()
                     batch = self._next_batch("train")
+                    fetch_wait_seconds += time.perf_counter() - fetch_start
                     with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.device.type == "cuda"):
                         output = self.model(batch["input_ids"], labels=batch["labels"], forward_context=ctx)
                         loss = output["loss"] / self.config.grad_accum_steps
@@ -430,6 +483,7 @@ class Trainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step = step
+                progress.update(1)
 
                 if step % self.config.log_interval == 0:
                     now = time.perf_counter()
@@ -437,7 +491,7 @@ class Trainer:
                     tokens_per_sec = (self.config.log_interval * self.config.grad_accum_steps * self.config.batch_size * self.config.data.sequence_length) / elapsed
                     active_layers = sorted(ctx.active_layers) if ctx.active_layers is not None else list(range(self.config.model.num_hidden_layers))
                     usage_summary = {layer: blocks for layer, blocks in list(last_block_usage.items())[:4]}
-                    print(
+                    tqdm.write(
                         json.dumps(
                             {
                                 "step": step,
@@ -445,6 +499,8 @@ class Trainer:
                                 "lr": self.scheduler.get_last_lr()[0],
                                 "tokens_processed": self.tokens_processed,
                                 "tokens_per_sec": round(tokens_per_sec, 2),
+                                "fetch_wait_seconds": round(fetch_wait_seconds, 4),
+                                "prefetch_qsize": self.train_prefetcher.qsize() if self.train_prefetcher is not None else None,
                                 "active_layers": active_layers,
                                 "full_update": ctx.full_update,
                                 "ffn_block_usage_sample": usage_summary,
@@ -455,20 +511,32 @@ class Trainer:
                     self.last_log_time = now
 
                 if step % self.config.val_interval == 0:
+                    val_start = time.perf_counter()
                     val_loss, last_val_perplexity = self.evaluate()
+                    val_wall_seconds = time.perf_counter() - val_start
+                    self.last_validation_loss = val_loss
+                    self.last_validation_perplexity = last_val_perplexity
                     if math.isfinite(last_val_perplexity):
                         self.best_val_perplexity = last_val_perplexity if self.best_val_perplexity is None else min(self.best_val_perplexity, last_val_perplexity)
-                    print(json.dumps({"step": step, "validation_loss": val_loss, "validation_perplexity": last_val_perplexity, "best_validation_perplexity": self.best_val_perplexity}))
+                    tqdm.write(json.dumps({"step": step, "validation_loss": val_loss, "validation_perplexity": last_val_perplexity, "best_validation_perplexity": self.best_val_perplexity, "validation_wall_seconds": round(val_wall_seconds, 4)}))
+                    if self.config.stop_at_val_loss is not None and math.isfinite(val_loss) and val_loss <= self.config.stop_at_val_loss:
+                        checkpoint_path = self.save_checkpoint(step, last_val_perplexity, tag="threshold")
+                        self.stop_reason = "val_loss_threshold"
+                        tqdm.write(json.dumps({"step": step, "stop_reason": self.stop_reason, "checkpoint": str(checkpoint_path), "target_val_loss": self.config.stop_at_val_loss}))
+                        return {"stop_reason": self.stop_reason, "checkpoint": str(checkpoint_path), "step": step, "validation_loss": val_loss}
 
                 if step % self.config.checkpoint_interval == 0:
+                    checkpoint_start = time.perf_counter()
                     self.save_checkpoint(step, last_val_perplexity)
+                    tqdm.write(json.dumps({"step": step, "checkpoint_wall_seconds": round(time.perf_counter() - checkpoint_start, 4), "prefetch_qsize": self.train_prefetcher.qsize() if self.train_prefetcher is not None else None}))
 
-            self.save_checkpoint(self.global_step, tag="final")
+            final_checkpoint = self.save_checkpoint(self.global_step, tag="final")
+            self.stop_reason = "max_steps"
             if self.config.test_mode and self.tokens_processed > 0:
                 total_elapsed = max(time.perf_counter() - self.train_start_time, 1e-6)
                 avg_tokens_per_sec = self.tokens_processed / total_elapsed
                 projected_seconds = self.config.projection_target_tokens / avg_tokens_per_sec
-                print(
+                tqdm.write(
                     json.dumps(
                         {
                             "test_mode_benchmark": True,
@@ -481,12 +549,14 @@ class Trainer:
                         }
                     )
                 )
+            return {"stop_reason": self.stop_reason, "checkpoint": str(final_checkpoint), "step": self.global_step, "validation_loss": self.last_validation_loss}
         except KeyboardInterrupt:
             if self.config.checkpointing.save_on_exit and self.global_step > 0 and not self._exit_checkpoint_written:
                 self.save_checkpoint(self.global_step, tag="interrupt")
                 self._exit_checkpoint_written = True
             raise
         finally:
+            progress.close()
             if self.train_prefetcher is not None:
                 self.train_prefetcher.close()
 

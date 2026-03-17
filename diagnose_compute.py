@@ -6,6 +6,7 @@ import time
 from statistics import mean
 
 import torch
+from tqdm.auto import tqdm
 
 from data.streaming_dataset import build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
@@ -128,7 +129,7 @@ def main():
     losses = []
 
     total_steps = args.warmup_steps + args.num_steps
-    for step_idx in range(total_steps):
+    for step_idx in tqdm(range(total_steps), desc="steps", dynamic_ncols=True):
         batch, fetch_seconds = timed_fetch(dataset, args.batch_size, device)
         optimizer.zero_grad(set_to_none=True)
         step_stats = timed_step(model, optimizer, batch, device, autocast_dtype)
@@ -186,7 +187,7 @@ def main():
         hints.append("overall_compute_throughput_is_low_for_h100")
     result["hints"] = hints
 
-    print(json.dumps(result, indent=2))
+    tqdm.write(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
