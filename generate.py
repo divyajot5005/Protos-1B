@@ -7,6 +7,7 @@ import torch
 
 from data.tokenizer_pipeline import load_qwen_tokenizer
 from model.transformer import CausalLMModel
+from training.checkpoints import extract_model_state_dict, normalize_model_state_dict_keys
 from training.runtime import configure_torch_runtime
 from training.trainer import load_training_config
 
@@ -76,7 +77,9 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device) -> 
 
     model = CausalLMModel(config.model).to(device)
     payload = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(payload["model"])
+    model_state = extract_model_state_dict(payload)
+    model_state = normalize_model_state_dict_keys(model_state, model.state_dict().keys())
+    model.load_state_dict(model_state)
     return model, tokenizer
 
 

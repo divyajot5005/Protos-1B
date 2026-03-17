@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from data.streaming_dataset import DataSource, DatasetConfig, build_streaming_dataset
 from data.tokenizer_pipeline import load_qwen_tokenizer
 from model.transformer import CausalLMModel, ModelConfig
+from training.checkpoints import extract_model_state_dict, normalize_model_state_dict_keys
 from training.layer_sampler import LayerSampler, LayerSamplingConfig
 from training.runtime import build_adamw, configure_torch_runtime
 from training.schedulers import build_cosine_scheduler
@@ -368,7 +369,9 @@ class Trainer:
 
     def resume(self, checkpoint_path: str) -> None:
         payload = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(payload["model"])
+        model_state = extract_model_state_dict(payload)
+        model_state = normalize_model_state_dict_keys(model_state, self.model.state_dict().keys())
+        self.model.load_state_dict(model_state)
         if "optimizer" in payload:
             self.optimizer.load_state_dict(payload["optimizer"])
         if "scheduler" in payload:
@@ -389,7 +392,9 @@ class Trainer:
 
     def load_stage_checkpoint(self, checkpoint_path: str) -> None:
         payload = torch.load(checkpoint_path, map_location=self.device)
-        missing_keys, unexpected_keys = self.model.load_state_dict(payload["model"], strict=False)
+        model_state = extract_model_state_dict(payload)
+        model_state = normalize_model_state_dict_keys(model_state, self.model.state_dict().keys())
+        missing_keys, unexpected_keys = self.model.load_state_dict(model_state, strict=False)
         self.train_dataset.load_state_dict(payload.get("train_dataset"))
         self.val_dataset.load_state_dict(payload.get("val_dataset"))
         self._restore_rng_state(payload.get("rng_state"))
