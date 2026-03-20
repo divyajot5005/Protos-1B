@@ -16,7 +16,9 @@ def parse_args():
     parser.add_argument("--dense-max-steps", type=int, default=None, help="Safety cap for dense bootstrap phase")
     parser.add_argument("--max-steps", type=int, default=None, help="Final total max steps for the sparse phase")
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--dense-batch-size", type=int, default=None, help="Override microbatch size for the dense bootstrap phase only")
     parser.add_argument("--grad-accum-steps", type=int, default=None)
+    parser.add_argument("--dense-grad-accum-steps", type=int, default=None, help="Override gradient accumulation for the dense bootstrap phase only")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--dense-output-dir", type=str, default=None)
     parser.add_argument("--sparse-output-dir", type=str, default=None)
@@ -44,6 +46,10 @@ def main():
     dense_config = deepcopy(sparse_config)
     dense_config.output_dir = args.dense_output_dir or f"{sparse_config.output_dir}_dense_bootstrap"
     dense_config.max_steps = args.dense_max_steps or sparse_config.max_steps
+    if args.dense_batch_size is not None:
+        dense_config.batch_size = args.dense_batch_size
+    if args.dense_grad_accum_steps is not None:
+        dense_config.grad_accum_steps = args.dense_grad_accum_steps
     dense_config.stop_at_val_loss = args.switch_val_loss
     dense_config.model.dense_baseline = True
     dense_config.model.train_base_weights = True
