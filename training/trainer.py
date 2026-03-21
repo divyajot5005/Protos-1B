@@ -58,7 +58,7 @@ class TrainingConfig:
     val_interval: int = 100
     val_steps: int = 20
     log_interval: int = 10
-    checkpoint_interval: int = 200
+    checkpoint_interval: int = 10000
     bf16: bool = True
     compile_model: bool = False
     seed: int = 7
