@@ -14,7 +14,19 @@
         "path": "HuggingFaceFW/fineweb",
         "name": "sample-10BT",
         "split": "train",
-        "text_field": "text"
+        "text_field": "text",
+        "hash_partition_modulus": 100,
+        "hash_partition_exclude_remainders": [0]
+      }
+    ],
+    "validation_sources": [
+      {
+        "path": "HuggingFaceFW/fineweb",
+        "name": "sample-10BT",
+        "split": "train",
+        "text_field": "text",
+        "hash_partition_modulus": 100,
+        "hash_partition_remainder": 0
       }
     ]
   }

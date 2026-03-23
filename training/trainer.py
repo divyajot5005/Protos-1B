@@ -38,7 +38,7 @@ class OptimizerConfig:
 class CheckpointConfig:
     save_optimizer_state: bool = True
     save_rng_state: bool = True
-    keep_last_k: int = 3
+    keep_last_k: int = 2
     save_on_exit: bool = True
 
 
@@ -126,6 +126,17 @@ def _is_transient_data_error(exc: Exception) -> bool:
         "timeout",
     )
     return any(marker in message for marker in transient_markers)
+
+
+def _is_checkpoint_write_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    write_markers = (
+        "file write failed",
+        "unexpected pos",
+        "no space left on device",
+        "disk quota exceeded",
+    )
+    return any(marker in message for marker in write_markers)
 
 
 class BackgroundBatchPrefetcher:
@@ -319,7 +330,19 @@ class Trainer:
             cuda_states = [self._coerce_rng_state_tensor(rng_state) for rng_state in state["cuda"]]
             torch.cuda.set_rng_state_all(cuda_states)
 
-    def _checkpoint_payload(self, step: int, last_val_perplexity: float | None = None) -> dict[str, Any]:
+    def _checkpoint_payload(
+        self,
+        step: int,
+        last_val_perplexity: float | None = None,
+        *,
+        include_optimizer_state: bool | None = None,
+        include_rng_state: bool | None = None,
+        include_prefetch_buffer: bool = True,
+    ) -> dict[str, Any]:
+        if include_optimizer_state is None:
+            include_optimizer_state = self.config.checkpointing.save_optimizer_state
+        if include_rng_state is None:
+            include_rng_state = self.config.checkpointing.save_rng_state
         payload = {
             "step": step,
             "tokens_processed": self.tokens_processed,
@@ -329,12 +352,16 @@ class Trainer:
             "model": self.model.state_dict(),
             "train_dataset": self.train_dataset.state_dict(),
             "val_dataset": self.val_dataset.state_dict(),
-            "train_prefetch_buffer": self.train_prefetcher.snapshot(self.PREFETCH_CHECKPOINT_LIMIT) if self.train_prefetcher is not None else [],
+            "train_prefetch_buffer": (
+                self.train_prefetcher.snapshot(self.PREFETCH_CHECKPOINT_LIMIT)
+                if include_prefetch_buffer and self.train_prefetcher is not None
+                else []
+            ),
         }
-        if self.config.checkpointing.save_optimizer_state:
+        if include_optimizer_state:
             payload["optimizer"] = self.optimizer.state_dict()
             payload["scheduler"] = self.scheduler.state_dict()
-        if self.config.checkpointing.save_rng_state:
+        if include_rng_state:
             payload["rng_state"] = self._capture_rng_state()
         return payload
 
@@ -348,12 +375,42 @@ class Trainer:
             path.unlink(missing_ok=True)
 
     def _save_latest_alias(self, checkpoint_path: Path) -> None:
-        shutil.copy2(checkpoint_path, self.latest_checkpoint_path)
+        self.latest_checkpoint_path.unlink(missing_ok=True)
+        try:
+            os.link(checkpoint_path, self.latest_checkpoint_path)
+        except OSError:
+            shutil.copy2(checkpoint_path, self.latest_checkpoint_path)
 
     def save_checkpoint(self, step: int, last_val_perplexity: float | None = None, tag: str | None = None) -> Path:
         suffix = f"_{tag}" if tag else ""
         checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{step}{suffix}.pt"
-        torch.save(self._checkpoint_payload(step, last_val_perplexity), checkpoint_path)
+        temp_checkpoint_path = checkpoint_path.with_suffix(f"{checkpoint_path.suffix}.tmp")
+        temp_checkpoint_path.unlink(missing_ok=True)
+        try:
+            torch.save(self._checkpoint_payload(step, last_val_perplexity), temp_checkpoint_path)
+        except RuntimeError as exc:
+            temp_checkpoint_path.unlink(missing_ok=True)
+            if not _is_checkpoint_write_error(exc):
+                raise
+            reduced_payload = self._checkpoint_payload(
+                step,
+                last_val_perplexity,
+                include_optimizer_state=False,
+                include_rng_state=False,
+                include_prefetch_buffer=False,
+            )
+            reduced_payload["checkpoint_mode"] = "reduced_no_optimizer"
+            torch.save(reduced_payload, temp_checkpoint_path)
+            tqdm.write(
+                json.dumps(
+                    {
+                        "step": step,
+                        "checkpoint_mode": "reduced_no_optimizer",
+                        "reason": "full_checkpoint_write_failed",
+                    }
+                )
+            )
+        os.replace(temp_checkpoint_path, checkpoint_path)
         self._save_latest_alias(checkpoint_path)
         self._cleanup_old_checkpoints()
         self.last_checkpoint_path = str(checkpoint_path)

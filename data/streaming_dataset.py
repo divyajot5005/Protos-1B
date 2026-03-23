@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import itertools
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -19,6 +20,9 @@ class DataSource:
     text_field: str = "text"
     streaming: bool = True
     shuffle_buffer: int = 10000
+    hash_partition_modulus: int | None = None
+    hash_partition_remainder: int | None = None
+    hash_partition_exclude_remainders: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -77,6 +81,22 @@ class ResumablePackedDataset:
         ]
         yield from itertools.cycle(examples)
 
+    def _hash_partition_matches(self, text: str, source: DataSource) -> bool:
+        modulus = source.hash_partition_modulus
+        if modulus is None:
+            return True
+        if modulus <= 0:
+            raise ValueError("hash_partition_modulus must be positive when provided.")
+
+        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+        bucket = int.from_bytes(digest, "big") % modulus
+
+        if source.hash_partition_remainder is not None and bucket != source.hash_partition_remainder:
+            return False
+        if bucket in source.hash_partition_exclude_remainders:
+            return False
+        return True
+
     def _source_iter(self, source: DataSource) -> Iterator[dict[str, str]]:
         dataset = load_dataset(
             path=source.path,
@@ -88,7 +108,7 @@ class ResumablePackedDataset:
             dataset = dataset.shuffle(seed=self.config.seed, buffer_size=source.shuffle_buffer)
         for record in dataset:
             text = record[source.text_field]
-            if text:
+            if text and self._hash_partition_matches(text, source):
                 yield {"text": text}
 
     def _build_record_iter(self) -> Iterator[dict[str, str]]:
